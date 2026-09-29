@@ -1,0 +1,252 @@
+name: Publish Risklence Scanner Image
+
+on:
+  # Manual only, matching deploy-dev/staging/production.yml — this repo has
+  # no branch protection to gate an automatic push-triggered publish (see
+  # deploy-production.yml's own note on why), so a scanner maintainer
+  # explicitly runs this from the Actions tab after apps/scanner changes.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Extra image tag to publish alongside :latest (optional, e.g. a version like v0.2.0)"
+        required: false
+        default: ""
+
+jobs:
+  # CA-03.4 — a multi-architecture manifest can't be `--load`ed into the
+  # local daemon as one unit, so each architecture is built, smoke-tested,
+  # and Trivy-scanned individually here; `publish` only runs (and only then
+  # does the real multi-arch build+push) once every matrix leg passes. A
+  # failing smoke test or an unresolved Critical/High finding blocks
+  # publish outright, not just a warning.
+  verify:
+    name: Verify (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image for verification
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: risklence-scanner:verify
+
+      - name: Smoke test
+        # Runs the actual built image, not just the build — a crashed CLI
+        # or a missing bundled tool must never reach GHCR.
+        run: |
+          # First, exactly how a customer starts it: no --entrypoint override,
+          # no --platform, just the image and the arguments from the install
+          # guide. This is the only check here that exercises the image's own
+          # ENTRYPOINT/CMD, and it is why it comes first.
+          #
+          # A trailing comment on `ENTRYPOINT [...]` in the Dockerfile makes the
+          # line invalid JSON, so Docker silently falls back to shell form and
+          # the container dies with `[risklence-scanner]: not found`. Every
+          # check below overrides --entrypoint and therefore passes anyway —
+          # which is exactly how that shipped undetected for two weeks.
+          # No arguments: exercises ENTRYPOINT together with the default CMD.
+          docker run --rm --platform ${{ matrix.platform }} risklence-scanner:verify \
+            | grep -q "Usage: risklence-scanner"
+          # With arguments: exercises ENTRYPOINT plus argument pass-through,
+          # which shell-form silently discards. `activate` is the first command
+          # a customer runs, so its absence here would be the failure that
+          # matters. Nothing below needs credentials.
+          docker run --rm --platform ${{ matrix.platform }} risklence-scanner:verify --help \
+            | grep -q "activate"
+
+          docker run --rm --platform ${{ matrix.platform }} --entrypoint python risklence-scanner:verify -c "
+          from scanner_agent.tool_checks import check_all_tools
+          results = check_all_tools()
+          missing = [r.tool for r in results if not r.available]
+          assert not missing, f'missing tools on ${{ matrix.platform }}: {missing}'
+          print('Tools OK:', {r.tool: r.version for r in results})
+          "
+
+          # #299 — the check above sees bundled *binaries*, and cannot see a
+          # truncated agent package. The image published on 2026-07-19 carried
+          # nmap, subfinder and nuclei while shipping five modules: it had no
+          # command_signing, so it rejected every signed command and no
+          # discovery could run at all; and no nuclei_runner or
+          # subfinder_runner, so it carried two binaries it could not drive.
+          #
+          # Asserted against the same list the agent's own test uses, so the
+          # release gate and the unit suite cannot disagree about what a
+          # Collector must contain.
+          docker run --rm --platform ${{ matrix.platform }} --entrypoint python risklence-scanner:verify -c "
+          import importlib, pkgutil, scanner_agent
+          required = {
+              'api_client', 'cli', 'command_signing', 'config', 'config_redaction',
+              'health_checks', 'host_credentials', 'host_inspection', 'nmap_runner',
+              'nuclei_runner', 'service', 'subfinder_runner', 'system_info', 'tool_checks',
+          }
+          present = {m.name for m in pkgutil.iter_modules(scanner_agent.__path__)}
+          missing = sorted(required - present)
+          assert not missing, f'truncated agent package on ${{ matrix.platform }}: {missing}'
+          for name in sorted(required):
+              importlib.import_module('scanner_agent.' + name)
+          print('Agent package OK:', len(present), 'modules')
+          "
+
+      - name: Trivy container scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_TIMEOUT: 15m
+        with:
+          image-ref: risklence-scanner:verify
+          scan-type: image
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+
+  publish:
+    name: Publish
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # CA-03.3 — required for cosign's keyless signing (Sigstore Fulcio
+      # issues a short-lived cert bound to this workflow run's own OIDC
+      # identity; no long-lived signing key stored anywhere).
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # CA-03.1 — this runner is amd64-only; QEMU emulation is what lets it
+      # also build the arm64 target below.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR as the Risklence account
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: Risklence
+          password: ${{ secrets.GHCR_RISKLENCE_TOKEN }}
+
+      - name: Build tag list
+        id: tags
+        # A1 security remediation — Semgrep run-shell-injection finding,
+        # and this one is real (not just a documented non-issue like the
+        # deploy-app-platform.yml findings): inputs.tag is genuine
+        # workflow_dispatch free-text input, so a maliciously crafted tag
+        # value interpolated directly into `run:` would be shell-executed.
+        # Passed through env: + $EXTRA_TAG instead.
+        env:
+          EXTRA_TAG: ${{ inputs.tag }}
+        run: |
+          TAGS="ghcr.io/risklence/risklence-scanner:latest"
+          TAGS="$TAGS,ghcr.io/risklence/risklence-scanner:sha-${GITHUB_SHA::7}"
+          if [ -n "$EXTRA_TAG" ]; then
+            TAGS="$TAGS,ghcr.io/risklence/risklence-scanner:$EXTRA_TAG"
+          fi
+          echo "list=$TAGS" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # CA-03.1 — one multi-architecture manifest per tag; a build
+          # failure on either platform fails this whole step, not just one.
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          # CA-03.3 — SBOM + provenance attestations, native to BuildKit
+          # (no external tool needed for generation).
+          sbom: true
+          provenance: true
+
+      - name: Assert the published image runs on Intel and ARM
+        # Søren, 2026-09-28: an Apple Silicon customer ran the activation
+        # command we show and got `no matching manifest for linux/arm64/v8` —
+        # :latest held linux/amd64 only. The verify job tests each architecture
+        # as it is built; nothing looked at what was pushed. This reads the
+        # pushed digest and :latest back and fails the run, before signing, if
+        # either lacks linux/amd64 or linux/arm64. The activation command is
+        # the product's front door.
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for REF in \
+            "ghcr.io/risklence/risklence-scanner@${DIGEST}" \
+            "ghcr.io/risklence/risklence-scanner:latest"; do
+            echo "Checking ${REF}"
+            docker buildx imagetools inspect --raw "${REF}" \
+              | python3 apps/scanner/scripts/assert_manifest_platforms.py
+          done
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the published image (keyless)
+        # CA-03.3 — signs the immutable digest, once, and every tag in the
+        # list resolves to that same digest; signing per-tag would just be
+        # the same signature repeated under a different name.
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes "ghcr.io/risklence/risklence-scanner@${DIGEST}"
+
+      - name: Generate and publish component manifest
+        # CA-03.3 — records exactly what shipped: bundled tool/template-pack
+        # versions (read from the real running image, not the source repo,
+        # so this can never drift from what was actually built) plus the
+        # image digest customers check the signature against.
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          IMAGE_REF="ghcr.io/risklence/risklence-scanner@${DIGEST}"
+          docker pull --platform linux/amd64 "$IMAGE_REF"
+          docker run --rm --entrypoint python "$IMAGE_REF" -c "
+          import json
+          import tomllib
+          from scanner_agent.tool_checks import check_all_tools
+
+          with open('/opt/risklence-scanner/pyproject.toml', 'rb') as f:
+              pyproject = tomllib.load(f)
+
+          manifest = {
+              'image_digest': '${DIGEST}',
+              'scanner_agent_version': pyproject['tool']['poetry']['version'],
+              'tools': {
+                  result.tool: {'available': result.available, 'version': result.version}
+                  for result in check_all_tools()
+              },
+          }
+          print(json.dumps(manifest, indent=2))
+          " > component-manifest.json
+          echo '## Component manifest' >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat component-manifest.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "Manifest checksum: $(sha256sum component-manifest.json)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload component manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: component-manifest
+          path: component-manifest.json
