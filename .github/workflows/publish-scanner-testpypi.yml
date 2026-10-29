@@ -1,0 +1,57 @@
+name: Publish Risklence Scanner to TestPyPI
+
+# A rehearsal of publish-scanner-pypi.yml against https://test.pypi.org: same
+# gate, same tests, same build (scanner-release-build.yml), different index.
+# Nothing here reaches real PyPI or the platform's "newest Collector" announcement.
+#
+# Runs only on a `scanner-test-vX.Y.Z` tag. The version must equal pyproject.toml;
+# TestPyPI, like PyPI, never lets a version be uploaded twice, so a re-run needs a
+# new version in pyproject.toml (for example 0.2.0.dev2) and a new tag.
+#
+# Trusted publishing, no stored token: add a pending publisher on test.pypi.org
+# for owner Risklence, repository scanner, workflow `publish-scanner-testpypi.yml`,
+# environment `testpypi`.
+
+# SOURCE OF TRUTH: this file is kept in the Risklence monorepo under
+# scripts/mirror-workflows/ and copied by scripts/sync_scanner_public.sh into
+# .github/workflows/ of the public Risklence/scanner repository, from which the
+# Collector is published (owner Risklence, repository scanner). It is deliberately
+# NOT under the monorepo's .github/workflows, so a tag pushed in the monorepo can
+# never start it. Edit it in the monorepo; the next sync overwrites any change
+# made in the public repository.
+
+on:
+  push:
+    tags:
+      - "scanner-test-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Gate, test and build
+    uses: ./.github/workflows/scanner-release-build.yml
+    with:
+      tag: ${{ github.ref_name }}
+
+  publish:
+    name: Publish to TestPyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/risklence-scanner/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download the distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: scanner-dist
+          path: dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/

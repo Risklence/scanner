@@ -1,0 +1,98 @@
+name: Scanner release build (reusable)
+
+# The one place that gates, tests and builds the Collector for both
+# publish-scanner-pypi.yml (real PyPI) and publish-scanner-testpypi.yml (TestPyPI),
+# so the two cannot drift apart. It uploads nothing outside this run: publishing
+# stays in the calling workflow, which holds the id-token permission and the
+# environment the PyPI trusted publisher is bound to.
+#
+# SOURCE OF TRUTH: this file is kept in the Risklence monorepo under
+# scripts/mirror-workflows/ and copied by scripts/sync_scanner_public.sh into
+# .github/workflows/ of the public Risklence/scanner repository, whose root IS the
+# package root. It is deliberately NOT under the monorepo's .github/workflows, so
+# a tag pushed in the monorepo can never start it. Edit it in the monorepo; a
+# change made in the public repository is overwritten by the next sync.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "The git tag being released: scanner-vX.Y.Z or scanner-test-vX.Y.Z"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Test and check versions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: The tag names the version the package declares
+        # The tag must equal the version in pyproject.toml. That pyproject.toml also
+        # equals the platform's LATEST_COLLECTOR_VERSION was enforced in the monorepo
+        # before this snapshot was synced (a test, and the sync itself, refuse
+        # otherwise); the platform is not reachable from here.
+        env:
+          TAG: ${{ inputs.tag }}
+        run: python3 scripts/check_release_version.py "$TAG"
+
+      - name: Install the scanner and its test dependencies
+        run: python -m pip install . pytest "responses>=0.24,<0.25"
+
+      - name: Install nmap, then the pinned subfinder, nuclei and template pack
+        # test_nuclei_runner needs nuclei on PATH. The Collector installs its own
+        # tools: install-tools downloads the versions pinned in
+        # scanner_agent/tool_installer_constants.py and tool_pins.env and refuses
+        # any archive whose sha256 differs from the reviewed one, so this job runs
+        # exactly what a customer's local install runs, with no second copy of the
+        # version here. nmap comes from apt (it is the one tool install-tools hands
+        # to a package manager, which needs administrator rights on Linux).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nmap
+          risklence-scanner install-tools --yes
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Show what is installed
+        run: |
+          nmap --version | head -1
+          nuclei -version
+
+      - name: Run the scanner tests
+        run: python -m pytest -q
+
+  build:
+    name: Build sdist and wheel
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build
+        run: |
+          python -m pip install build twine
+          python -m build --outdir dist .
+          python -m twine check dist/*
+
+      - name: Upload the distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanner-dist
+          path: dist/
+          if-no-files-found: error

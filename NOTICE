@@ -1,0 +1,44 @@
+Risklence Collector
+Copyright 2026 Risklence
+
+This product includes software developed by Risklence (https://github.com/Risklence/scanner).
+
+Licensed under the Apache License, Version 2.0 (see the LICENSE file). If you
+redistribute the Collector, or a work derived from it, you must keep this NOTICE
+file (or its content) with it, as section 4(d) of that licence requires, and you
+must keep saying that Risklence made the original.
+
+What the Apache-2.0 licence covers
+----------------------------------
+The Collector's own source code in this repository (the Python package
+`scanner_agent`, its tests, scripts and documentation). Nothing else.
+
+Third-party tools the Collector runs
+------------------------------------
+The Collector does not contain these tools in its Python package. It runs them as
+separate programs, and the Docker image and `risklence-scanner install-tools` put
+them on a machine. Each keeps its own licence, which is not Apache-2.0:
+
+- nmap (https://nmap.org). Licensed under the Nmap Public Source License (NPSL,
+  https://nmap.org/npsl/), a licence of its own, not Apache-2.0 and not MIT. The
+  NPSL has terms about redistributing nmap, including in a product or an image
+  you distribute to others. Read it before you redistribute an image that
+  contains nmap. The Collector's Docker image installs nmap from the Debian
+  package archive.
+- subfinder (https://github.com/projectdiscovery/subfinder). MIT licence. Pinned
+  by `install-tools` at the version in
+  `scanner_agent/tool_installer_constants.py`; the Docker image builds the
+  version current at build time.
+- nuclei (https://github.com/projectdiscovery/nuclei). MIT licence. Pinned the
+  same way as subfinder.
+- nuclei-templates (https://github.com/projectdiscovery/nuclei-templates). MIT
+  licence. The pinned release in `scanner_agent/tool_pins.env`.
+
+Python dependencies
+-------------------
+click (BSD-3-Clause), requests (Apache-2.0) and defusedxml (PSF-2.0) are
+installed from PyPI with the Collector under their own licences.
+
+This file states which licence each component carries, as published by its
+project when this file was written. It is not legal advice; the licence text
+published by each project is what applies.

@@ -1,0 +1,62 @@
+name: Publish Risklence Scanner to PyPI
+
+# Søren, 2026-10-07: a customer who cannot run Docker installs the Collector with
+# `pip install risklence-scanner` into a private folder (the product shows the exact
+# line). That needs the package on PyPI.
+#
+# Runs only on a version tag (`scanner-v0.2.0`), never on a branch push: publishing
+# to PyPI is outward-facing and cannot be undone (a version, once uploaded, can be
+# yanked but never re-used). The tag is the decision.
+#
+# Rehearse on TestPyPI first (scanner-test-v* tag, publish-scanner-testpypi.yml).
+# The gate, tests and build are shared with that workflow through
+# scanner-release-build.yml; only the publish job below is specific to real PyPI.
+#
+# No API token is stored anywhere. PyPI "trusted publishing" accepts the OIDC
+# identity of this exact workflow run, in this exact environment. The one-time
+# PyPI-side setup is a pending publisher: owner Risklence, repository scanner, workflow
+# file publish-scanner-pypi.yml, environment pypi.
+
+# SOURCE OF TRUTH: this file is kept in the Risklence monorepo under
+# scripts/mirror-workflows/ and copied by scripts/sync_scanner_public.sh into
+# .github/workflows/ of the public Risklence/scanner repository, from which the
+# Collector is published (owner Risklence, repository scanner). It is deliberately
+# NOT under the monorepo's .github/workflows, so a tag pushed in the monorepo can
+# never start it. Edit it in the monorepo; the next sync overwrites any change
+# made in the public repository.
+
+on:
+  push:
+    tags:
+      - "scanner-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Gate, test and build
+    uses: ./.github/workflows/scanner-release-build.yml
+    with:
+      tag: ${{ github.ref_name }}
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # The environment is what the PyPI trusted publisher is bound to, and where
+    # a required reviewer can be added so a tag alone cannot publish.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/risklence-scanner/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download the distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: scanner-dist
+          path: dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
